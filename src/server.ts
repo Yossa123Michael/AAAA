@@ -276,6 +276,10 @@ app.post('/api/v1/admin/reset-transactions', async (_req: Request, res: Response
 
 // ==================== LISTEN SERVER ====================
 // Mendengarkan 0.0.0.0 agar bisa diakses dari HP pada jaringan Wi-Fi lokal
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[SERVER] Aktif dan siap menerima koneksi di port ${PORT}`);
-});
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`[SERVER] Aktif dan siap menerima koneksi di port ${PORT}`);
+  });
+}
+
+export default app;
