@@ -72,53 +72,109 @@ app.get('/api/v1/test-catalog', async (_req: Request, res: Response) => {
 
 // 3. Autentikasi RBAC
 app.post('/api/v1/auth/login', login);
+
 // Auto-alter tabel customers untuk mendukung Akun Login & Google Auth
 pool.query(`
   ALTER TABLE customers ADD COLUMN IF NOT EXISTS email VARCHAR(255);
   ALTER TABLE customers ADD COLUMN IF NOT EXISTS username VARCHAR(100);
   ALTER TABLE customers ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);
   ALTER TABLE customers ADD COLUMN IF NOT EXISTS google_id VARCHAR(255);
+  ALTER TABLE customers ADD COLUMN IF NOT EXISTS avatar_url TEXT;
 `).catch((err) => console.error('Customer auth migration error:', err.message));
 
-// 3B. Registrasi Akun Pelanggan Baru (Manual)
+// 3B. Registrasi Akun Pelanggan Baru (Manual & Account Merging dengan Google Auth)
 app.post('/api/v1/auth/customer/register', async (req: Request, res: Response) => {
   try {
     const { fullName, email, username, phone, password } = req.body;
-    if (!fullName || !phone || !password) {
-      return res.status(400).json({ success: false, message: 'Nama, No. WhatsApp, dan Password wajib diisi!' });
+    if (!fullName || !email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Nama Lengkap, Email, dan Password wajib diisi!',
+      });
     }
 
-    // Cek apakah email atau username sudah dipakai pelanggan lain
-    if (email || username) {
-      const checkDup = await pool.query(
-        `SELECT id FROM customers WHERE (email = $1 AND $1 IS NOT NULL AND $1 != '') OR (username = $2 AND $2 IS NOT NULL AND $2 != '')`,
-        [email || null, username || null]
-      );
-      if (checkDup.rows.length > 0) {
-        return res.status(400).json({ success: false, message: 'Email atau Username sudah digunakan!' });
-      }
-    }
+    const cleanEmail = String(email).trim().toLowerCase();
+    const cleanPhone = phone && String(phone).trim() ? String(phone).trim() : null;
+    const cleanUsername = username && String(username).trim() ? String(username).trim() : null;
 
-    // Cek apakah nomor HP sudah terdaftar sebelumnya di kasir POS
-    const existingPhone = await pool.query(`SELECT * FROM customers WHERE phone = $1 LIMIT 1`, [phone]);
+    // 1. Cek apakah email sudah pernah terdaftar (misal via Continue with Google atau daftar manual)
+    const existingEmail = await pool.query(
+      `SELECT * FROM customers WHERE LOWER(email) = LOWER($1) LIMIT 1`,
+      [cleanEmail]
+    );
 
     let customer;
-    if (existingPhone.rows.length > 0) {
+    if (existingEmail.rows.length > 0) {
+      const existingCust = existingEmail.rows[0];
+
+      // Jika password_hash sudah terisi, tolak dan arahkan untuk Login
+      if (existingCust.password_hash) {
+        return res.status(400).json({
+          success: false,
+          message: 'Email ini sudah terdaftar, silakan langsung Login.',
+        });
+      }
+
+      // Jika password_hash masih NULL (karena sebelumnya daftar/masuk lewat Google), satukan akunnya
       const updated = await pool.query(
         `UPDATE customers 
-         SET full_name = $1, email = COALESCE($2, email), username = COALESCE($3, username), password_hash = $4
-         WHERE id = $5 RETURNING *`,
-        [fullName, email || null, username || null, password, existingPhone.rows[0].id]
+         SET full_name = $1,
+             password_hash = $2,
+             phone = COALESCE($3, phone),
+             username = COALESCE($4, username)
+         WHERE id = $5 
+         RETURNING *`,
+        [fullName.trim(), password, cleanPhone, cleanUsername, existingCust.id]
       );
       customer = updated.rows[0];
     } else {
-      const inserted = await pool.query(
-        `INSERT INTO customers (outlet_id, full_name, phone, email, username, password_hash, loyalty_points, total_visits, total_spend)
-         VALUES ('22222222-2222-2222-2222-222222222222', $1, $2, $3, $4, $5, 0, 0, 0)
-         RETURNING *`,
-        [fullName, phone, email || null, username || null, password]
-      );
-      customer = inserted.rows[0];
+      // Cek duplikasi username jika diisi
+      if (cleanUsername) {
+        const checkUsername = await pool.query(
+          `SELECT id FROM customers WHERE LOWER(username) = LOWER($1) LIMIT 1`,
+          [cleanUsername]
+        );
+        if (checkUsername.rows.length > 0) {
+          return res.status(400).json({
+            success: false,
+            message: 'Username sudah digunakan!',
+          });
+        }
+      }
+
+      // Cek apakah nomor HP sudah terdaftar sebelumnya di kasir POS (jika nomor HP diisi)
+      if (cleanPhone) {
+        const existingPhone = await pool.query(
+          `SELECT * FROM customers WHERE phone = $1 LIMIT 1`,
+          [cleanPhone]
+        );
+        if (existingPhone.rows.length > 0) {
+          const updated = await pool.query(
+            `UPDATE customers 
+             SET full_name = $1,
+                 email = COALESCE($2, email),
+                 username = COALESCE($3, username),
+                 password_hash = $4
+             WHERE id = $5 
+             RETURNING *`,
+            [fullName.trim(), cleanEmail, cleanUsername, password, existingPhone.rows[0].id]
+          );
+          customer = updated.rows[0];
+        }
+      }
+
+      // Jika belum ada, buat baris customer baru
+      if (!customer) {
+        const generatedOrCleanPhone =
+          cleanPhone || `WA-${Math.floor(100000000 + Math.random() * 900000000)}`;
+        const inserted = await pool.query(
+          `INSERT INTO customers (outlet_id, full_name, phone, email, username, password_hash, loyalty_points, total_visits, total_spend)
+           VALUES ('22222222-2222-2222-2222-222222222222', $1, $2, $3, $4, $5, 0, 0, 0)
+           RETURNING *`,
+          [fullName.trim(), generatedOrCleanPhone, cleanEmail, cleanUsername, password]
+        );
+        customer = inserted.rows[0];
+      }
     }
 
     res.json({
@@ -128,9 +184,10 @@ app.post('/api/v1/auth/customer/register', async (req: Request, res: Response) =
         name: customer.full_name,
         email: customer.email,
         username: customer.username,
-        phone: customer.phone,
+        phone: customer.phone?.startsWith('WA-') ? '' : (customer.phone || ''),
         loyalty_points: customer.loyalty_points || 0,
         haircut_notes: customer.haircut_notes || '',
+        picture: customer.avatar_url || null,
         role: 'CUSTOMER',
       },
     });
@@ -142,20 +199,48 @@ app.post('/api/v1/auth/customer/register', async (req: Request, res: Response) =
 // 3C. Login Pelanggan (Bisa pakai Email, Username, atau Nomor HP)
 app.post('/api/v1/auth/customer/login', async (req: Request, res: Response) => {
   try {
-    const { identifier, password } = req.body;
+    const { identifier, email, password } = req.body;
+    const loginId = (identifier || email || '').trim();
+
+    if (!loginId || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email/Username/No. HP dan Password wajib diisi!',
+      });
+    }
+
     const result = await pool.query(
       `SELECT * FROM customers 
-       WHERE (LOWER(email) = LOWER($1) OR LOWER(username) = LOWER($1) OR phone = $1)
-       AND password_hash = $2
+       WHERE LOWER(email) = LOWER($1) OR LOWER(username) = LOWER($1) OR phone = $1
        LIMIT 1`,
-      [identifier, password]
+      [loginId]
     );
 
     if (result.rows.length === 0) {
-      return res.status(401).json({ success: false, message: 'Email/Username/No. HP atau Password salah!' });
+      return res.status(401).json({
+        success: false,
+        message: 'Email/Username/No. HP atau Password salah!',
+      });
     }
 
     const c = result.rows[0];
+
+    // Jika akun ditemukan tetapi password_hash masih NULL (karena dibuat via Google)
+    if (!c.password_hash) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'Akun ini terdaftar melalui Google. Silakan klik tombol Continue with Google atau daftar untuk mengatur password.',
+      });
+    }
+
+    if (c.password_hash !== password) {
+      return res.status(401).json({
+        success: false,
+        message: 'Email/Username/No. HP atau Password salah!',
+      });
+    }
+
     res.json({
       success: true,
       data: {
@@ -163,9 +248,10 @@ app.post('/api/v1/auth/customer/login', async (req: Request, res: Response) => {
         name: c.full_name,
         email: c.email,
         username: c.username,
-        phone: c.phone,
+        phone: c.phone?.startsWith('WA-') ? '' : (c.phone || ''),
         loyalty_points: c.loyalty_points || 0,
         haircut_notes: c.haircut_notes || '',
+        picture: c.avatar_url || null,
         role: 'CUSTOMER',
       },
     });
@@ -174,33 +260,80 @@ app.post('/api/v1/auth/customer/login', async (req: Request, res: Response) => {
   }
 });
 
-// 3D. Login / Register Otomatis Pelanggan via Google API
+// 3D. Login / Register Otomatis Pelanggan via Google OAuth2 API
 app.post('/api/v1/auth/customer/google', async (req: Request, res: Response) => {
   try {
-    const { email, name, googleId, phone } = req.body;
+    const { accessToken, phone } = req.body;
+    let { email, name, googleId, picture } = req.body;
+
+    // Jika accessToken dikirim dari Google OAuth2, verifikasi langsung ke Google UserInfo Endpoint
+    if (accessToken) {
+      const googleRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      });
+
+      if (!googleRes.ok) {
+        return res.status(401).json({
+          success: false,
+          message: 'Token Google OAuth2 tidak valid atau sudah kedaluwarsa.',
+        });
+      }
+
+      const googleProfile: any = await googleRes.json();
+      email = googleProfile.email;
+      name = googleProfile.name;
+      googleId = googleProfile.sub;
+      picture = googleProfile.picture;
+    }
+
     if (!email) {
       return res.status(400).json({ success: false, message: 'Email Google tidak valid' });
     }
 
+    const cleanEmail = String(email).trim().toLowerCase();
+
     const existing = await pool.query(
-      `SELECT * FROM customers WHERE LOWER(email) = LOWER($1) OR google_id = $2 LIMIT 1`,
-      [email, googleId]
+      `SELECT * FROM customers 
+       WHERE LOWER(email) = LOWER($1) 
+          OR ($2::text IS NOT NULL AND google_id = $2) 
+       LIMIT 1`,
+      [cleanEmail, googleId || null]
     );
 
     let c;
     if (existing.rows.length > 0) {
       const updated = await pool.query(
-        `UPDATE customers SET google_id = COALESCE($1, google_id), full_name = COALESCE(full_name, $2) WHERE id = $3 RETURNING *`,
-        [googleId, name, existing.rows[0].id]
+        `UPDATE customers 
+         SET google_id = COALESCE($1, google_id),
+             email = COALESCE(email, $2),
+             full_name = COALESCE(full_name, $3),
+             avatar_url = COALESCE($4, avatar_url)
+         WHERE id = $5 
+         RETURNING *`,
+        [
+          googleId || null,
+          cleanEmail,
+          name || cleanEmail.split('@')[0],
+          picture || null,
+          existing.rows[0].id,
+        ]
       );
       c = updated.rows[0];
     } else {
       const generatedPhone = phone || `WA-${Math.floor(100000000 + Math.random() * 900000000)}`;
       const inserted = await pool.query(
-        `INSERT INTO customers (outlet_id, full_name, email, google_id, phone, loyalty_points, total_visits, total_spend)
-         VALUES ('22222222-2222-2222-2222-222222222222', $1, $2, $3, $4, 0, 0, 0)
+        `INSERT INTO customers (outlet_id, full_name, email, google_id, phone, avatar_url, loyalty_points, total_visits, total_spend)
+         VALUES ('22222222-2222-2222-2222-222222222222', $1, $2, $3, $4, $5, 0, 0, 0)
          RETURNING *`,
-        [name || email.split('@')[0], email, googleId, generatedPhone]
+        [
+          name || cleanEmail.split('@')[0],
+          cleanEmail,
+          googleId || null,
+          generatedPhone,
+          picture || null,
+        ]
       );
       c = inserted.rows[0];
     }
@@ -211,9 +344,11 @@ app.post('/api/v1/auth/customer/google', async (req: Request, res: Response) => 
         id: c.id,
         name: c.full_name,
         email: c.email,
-        phone: c.phone?.startsWith('WA-') ? '' : c.phone,
+        username: c.username,
+        phone: c.phone?.startsWith('WA-') ? '' : (c.phone || ''),
         loyalty_points: c.loyalty_points || 0,
         haircut_notes: c.haircut_notes || '',
+        picture: c.avatar_url || picture || null,
         role: 'CUSTOMER',
       },
     });
@@ -221,6 +356,7 @@ app.post('/api/v1/auth/customer/google', async (req: Request, res: Response) => 
     res.status(500).json({ success: false, message: err.message });
   }
 });
+
 app.post('/api/v1/auth/register-customer', registerCustomer);
 app.post('/api/v1/auth/social-login', socialLogin);
 
