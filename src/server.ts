@@ -365,6 +365,36 @@ app.post('/api/v1/auth/customer/google', async (req: Request, res: Response) => 
   }
 });
 
+// 3E. Ambil Profil & Poin Terbaru Pelanggan (Real-time Sync)
+app.get('/api/v1/auth/customer/profile', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.query;
+    if (!id) return res.status(400).json({ success: false, message: 'ID diperlukan' });
+
+    const result = await pool.query('SELECT * FROM customers WHERE id = $1 LIMIT 1', [id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Pelanggan tidak ditemukan' });
+    }
+    const c = result.rows[0];
+    res.json({
+      success: true,
+      data: {
+        id: c.id,
+        name: c.full_name,
+        email: c.email,
+        username: c.username,
+        phone: c.phone?.startsWith('WA-') ? '' : (c.phone || ''),
+        loyalty_points: Number(c.loyalty_points || 0),
+        haircut_notes: c.haircut_notes || '',
+        picture: c.avatar_url || null,
+        role: 'CUSTOMER',
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // 4. POS Kasir & Transaksi
 app.post('/api/v1/pos/checkout', checkout);
 app.get('/api/v1/pos/transactions', getRecentTransactions);

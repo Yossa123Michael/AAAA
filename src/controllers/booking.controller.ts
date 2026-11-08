@@ -117,14 +117,15 @@ export const getBarberAvailability = async (req: Request, res: Response) => {
 export const createBooking = async (req: Request, res: Response) => {
   const client = await pool.connect();
   try {
-    const { 
-      outletId = '22222222-2222-2222-2222-222222222222', 
-      customerName, 
-      customerPhone, 
-      barberId, 
-      serviceId, 
-      date, 
-      bookingDate, 
+    const {
+      outletId = '22222222-2222-2222-2222-222222222222',
+      customerId: loggedInCustomerId,
+      customerName,
+      customerPhone,
+      barberId,
+      serviceId,
+      date,
+      bookingDate,
       startTime,
       haircutNotes,
       notes
@@ -157,30 +158,67 @@ export const createBooking = async (req: Request, res: Response) => {
 
     await client.query('BEGIN');
 
-    // 1. Ambil atau Buat Data Customer
-    let customerId: string;
-    const existingCust = await client.query(
-      'SELECT id FROM customers WHERE phone = $1',
-      [customerPhone || '081299887766']
-    );
+    // 1. Ambil atau Buat Data Customer (Prioritaskan Akun Member yang Sedang Login)
+    let customerId: string = '';
+    const cleanPhone = (customerPhone || '081299887766').trim();
+    const cleanName = (customerName || 'Pelanggan Online').trim();
 
-    if (existingCust.rowCount && existingCust.rowCount > 0) {
-      customerId = existingCust.rows[0].id;
-      // Perbarui catatan gaya rambut jika ada catatan baru
-      if (finalNotes) {
+    if (loggedInCustomerId) {
+      const checkMember = await client.query('SELECT id FROM customers WHERE id = $1', [loggedInCustomerId]);
+      if (checkMember.rowCount && checkMember.rowCount > 0) {
+        customerId = loggedInCustomerId;
+
+        // Jika nomor WA yang diketik tadinya dipakai oleh data lama (misal 'yanto'), satukan poinnya ke akun Yosself
+        const phoneConflict = await client.query(
+          'SELECT id, COALESCE(loyalty_points, 0) AS pts, COALESCE(total_visits, 0) AS visits, COALESCE(total_spend, 0) AS spend FROM customers WHERE phone = $1 AND id != $2',
+          [cleanPhone, customerId]
+        );
+
+        if (phoneConflict.rowCount && phoneConflict.rowCount > 0) {
+          for (const oldRow of phoneConflict.rows) {
+            await client.query('UPDATE bookings SET customer_id = $1 WHERE customer_id = $2', [customerId, oldRow.id]);
+            await client.query('UPDATE transactions SET customer_id = $1 WHERE customer_id = $2', [customerId, oldRow.id]);
+            await client.query(
+              `UPDATE customers 
+               SET loyalty_points = COALESCE(loyalty_points, 0) + $1,
+                   total_visits = COALESCE(total_visits, 0) + $2,
+                   total_spend = COALESCE(total_spend, 0) + $3
+               WHERE id = $4`,
+              [oldRow.pts, oldRow.visits, oldRow.spend, customerId]
+            );
+            await client.query('DELETE FROM customers WHERE id = $1', [oldRow.id]);
+          }
+        }
+
+        // Update nama, nomor WA, dan catatan cukur pada akun member yang login
         await client.query(
-          `UPDATE customers SET haircut_notes = $1, full_name = COALESCE($2, full_name) WHERE id = $3`,
-          [finalNotes, customerName, customerId]
+          `UPDATE customers 
+           SET full_name = $1, phone = $2, haircut_notes = COALESCE($3, haircut_notes)
+           WHERE id = $4`,
+          [cleanName, cleanPhone, finalNotes, customerId]
         );
       }
-    } else {
-      const newCust = await client.query(
-        `INSERT INTO customers (tenant_id, phone, full_name, segment, loyalty_points, haircut_notes)
-         VALUES ((SELECT tenant_id FROM outlets WHERE id = $1), $2, $3, 'NEW', 0, $4)
-         RETURNING id`,
-        [outletId, customerPhone || '081299887766', customerName || 'Pelanggan Online', finalNotes]
-      );
-      customerId = newCust.rows[0].id;
+    }
+
+    if (!customerId) {
+      const existingCust = await client.query('SELECT id FROM customers WHERE phone = $1 LIMIT 1', [cleanPhone]);
+      if (existingCust.rowCount && existingCust.rowCount > 0) {
+        customerId = existingCust.rows[0].id;
+        await client.query(
+          `UPDATE customers 
+           SET full_name = $1, haircut_notes = COALESCE($2, haircut_notes)
+           WHERE id = $3`,
+          [cleanName, finalNotes, customerId]
+        );
+      } else {
+        const newCust = await client.query(
+          `INSERT INTO customers (tenant_id, phone, full_name, segment, loyalty_points, haircut_notes)
+           VALUES ((SELECT tenant_id FROM outlets LIMIT 1), $1, $2, 'NEW', 0, $3)
+           RETURNING id`,
+          [cleanPhone, cleanName, finalNotes]
+        );
+        customerId = newCust.rows[0].id;
+      }
     }
 
     // 2. Ambil Informasi Layanan
