@@ -7,7 +7,7 @@ import './index';
 
 // Controllers
 import { checkout, getRecentTransactions, voidTransaction, validateVoucher, sendReceiptWhatsApp } from './controllers/pos.controller';
-import { getBarberAvailability, createBooking, getActiveBookings } from './controllers/booking.controller';
+import { getBarberAvailability, createBooking, getActiveBookings, confirmBookingPayment, cancelOrExpireBooking } from './controllers/booking.controller';
 import { closeShift, reopenShift } from './controllers/shift.controller';
 import { getDashboardSummary } from './controllers/dashboard.controller';
 import { getInventoryStocks, restockInventory } from './controllers/inventory.controller';
@@ -406,6 +406,85 @@ app.post('/api/v1/pos/send-receipt-wa', sendReceiptWhatsApp);
 app.get('/api/v1/bookings/availability', getBarberAvailability);
 app.post('/api/v1/bookings', createBooking);
 app.get('/api/v1/bookings/active', getActiveBookings);
+pool.query(`
+  ALTER TABLE bookings ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP WITH TIME ZONE;
+  ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_status VARCHAR(30) DEFAULT 'UNPAID';
+  ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_method VARCHAR(50);
+  ALTER TABLE bookings ADD COLUMN IF NOT EXISTS paid_at TIMESTAMP WITH TIME ZONE;
+  ALTER TABLE bookings DROP CONSTRAINT IF EXISTS bookings_status_check;
+`).catch((e) => console.error('Booking alter error:', e.message));
+
+// Endpoint Sinkronisasi & Auto-Merge Poin Member (Menggabungkan akun Google & POS seperti Yosself 38 Pts)
+app.get('/api/v1/auth/customer/profile', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.query;
+    if (!id) return res.status(400).json({ success: false, message: 'ID diperlukan' });
+
+    const mainRes = await pool.query('SELECT * FROM customers WHERE id = $1 LIMIT 1', [id]);
+    if (mainRes.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Pelanggan tidak ditemukan' });
+    }
+    let c = mainRes.rows[0];
+
+    // Cari apakah ada baris duplikat dengan nama yang sama (misal 'Yosself' di POS dengan 38 Pts)
+    const dupRes = await pool.query(
+      `SELECT * FROM customers
+       WHERE id != $1
+         AND (
+           LOWER(TRIM(full_name)) = LOWER(TRIM($2))
+           OR ($3::text IS NOT NULL AND $3 NOT LIKE 'WA-%' AND phone = $3)
+         )`,
+      [c.id, c.full_name || '', c.phone || null]
+    );
+
+    if (dupRes.rows.length > 0) {
+      for (const dup of dupRes.rows) {
+        await pool.query('UPDATE bookings SET customer_id = $1 WHERE customer_id = $2', [c.id, dup.id]);
+        await pool.query('UPDATE transactions SET customer_id = $1 WHERE customer_id = $2', [c.id, dup.id]);
+        const realPhone =
+          c.phone && !String(c.phone).startsWith('WA-')
+            ? c.phone
+            : dup.phone && !String(dup.phone).startsWith('WA-')
+            ? dup.phone
+            : c.phone;
+
+        const updated = await pool.query(
+          `UPDATE customers
+           SET loyalty_points = COALESCE(loyalty_points, 0) + COALESCE($1, 0),
+               total_visits = COALESCE(total_visits, 0) + COALESCE($2, 0),
+               total_spend = COALESCE(total_spend, 0) + COALESCE($3, 0),
+               phone = $4,
+               haircut_notes = COALESCE(haircut_notes, $5)
+           WHERE id = $6
+           RETURNING *`,
+          [dup.loyalty_points, dup.total_visits, dup.total_spend, realPhone, dup.haircut_notes, c.id]
+        );
+        c = updated.rows[0];
+        await pool.query('DELETE FROM customers WHERE id = $1', [dup.id]);
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        id: c.id,
+        name: c.full_name,
+        email: c.email,
+        username: c.username,
+        phone: c.phone?.startsWith('WA-') ? '' : (c.phone || ''),
+        loyalty_points: Number(c.loyalty_points || 0),
+        haircut_notes: c.haircut_notes || '',
+        picture: c.avatar_url || null,
+        role: 'CUSTOMER',
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.post('/api/v1/bookings/:id/pay', confirmBookingPayment);
+app.post('/api/v1/bookings/:id/cancel', cancelOrExpireBooking);
 
 // 6. Shift & Rekonsiliasi Kas
 app.post('/api/v1/shifts/:shiftId/close', closeShift);

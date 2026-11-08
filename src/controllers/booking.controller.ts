@@ -3,9 +3,26 @@ import { pool } from '../db';
 import { AvailabilityService } from '../services/availability';
 import { sendBookingConfirmationWA } from '../services/whatsapp.service';
 
+// Helper: Otomatis hanguskan pesanan PENDING_PAYMENT yang melewati batas 10 menit
+export const cleanupExpiredBookings = async () => {
+  try {
+    await pool.query(`
+      UPDATE bookings
+      SET status = 'EXPIRED'
+      WHERE status = 'PENDING_PAYMENT'
+        AND expires_at IS NOT NULL
+        AND expires_at <= NOW()
+    `);
+  } catch (err: any) {
+    console.error('[CLEANUP_EXPIRED_BOOKINGS_ERROR]', err.message);
+  }
+};
+
 // GET /api/v1/bookings/availability?barberId=...&date=YYYY-MM-DD&serviceId=...
 export const getBarberAvailability = async (req: Request, res: Response) => {
   try {
+    await cleanupExpiredBookings();
+
     const { barberId, date, serviceId, duration } = req.query;
 
     if (!barberId || !date) {
@@ -13,7 +30,7 @@ export const getBarberAvailability = async (req: Request, res: Response) => {
     }
 
     const bookingDate = new Date(`${date}T00:00:00`);
-    const dayOfWeek = bookingDate.getDay(); // 0 = Minggu, 1 = Senin, ...
+    const dayOfWeek = bookingDate.getDay();
 
     // 1. Cek Apakah Kapster Libur Rutin Mingguan
     const weeklyOffCheck = await pool.query(
@@ -60,13 +77,12 @@ export const getBarberAvailability = async (req: Request, res: Response) => {
 
     // 4. Ambil Jam Kerja Standar Barber
     const scheduleRes = await pool.query(
-      `SELECT start_time, end_time, break_start, break_end, is_day_off 
-       FROM barber_schedules 
+      `SELECT start_time, end_time, break_start, break_end, is_day_off
+       FROM barber_schedules
        WHERE barber_id = $1 AND day_of_week = $2`,
       [barberId, dayOfWeek]
     );
 
-    // Jika tidak ada jadwal default, gunakan jam operasional toko (09:00 - 21:00)
     const schedule = scheduleRes.rows[0] || {
       start_time: '09:00:00',
       end_time: '21:00:00',
@@ -82,11 +98,16 @@ export const getBarberAvailability = async (req: Request, res: Response) => {
       });
     }
 
-    // 5. Ambil Booking yang Masih Aktif pada Tanggal Tersebut
+    // 5. Ambil Booking yang Mengunci Slot (CONFIRMED/PAID/COMPLETED atau PENDING_PAYMENT yang belum lewat 10 menit)
     const existingBookingsRes = await pool.query(
-      `SELECT start_time, end_time 
-       FROM bookings 
-       WHERE barber_id = $1 AND booking_date = $2 AND status NOT IN ('CANCELLED', 'NO_SHOW')`,
+      `SELECT start_time, end_time
+       FROM bookings
+       WHERE barber_id = $1
+         AND booking_date = $2
+         AND (
+           UPPER(status) IN ('CONFIRMED', 'PAID', 'COMPLETED')
+           OR (UPPER(status) = 'PENDING_PAYMENT' AND expires_at > NOW())
+         )`,
       [barberId, date]
     );
 
@@ -113,10 +134,12 @@ export const getBarberAvailability = async (req: Request, res: Response) => {
   }
 };
 
-// POST /api/v1/bookings (Reservasi Baru)
+// POST /api/v1/bookings (Reservasi Baru dengan Hold Slot 10 Menit)
 export const createBooking = async (req: Request, res: Response) => {
   const client = await pool.connect();
   try {
+    await cleanupExpiredBookings();
+
     const {
       outletId = '22222222-2222-2222-2222-222222222222',
       customerId: loggedInCustomerId,
@@ -128,8 +151,15 @@ export const createBooking = async (req: Request, res: Response) => {
       bookingDate,
       startTime,
       haircutNotes,
-      notes
+      notes,
     } = req.body;
+
+    if (!loggedInCustomerId) {
+      return res.status(401).json({
+        success: false,
+        message: 'Silakan login atau buat akun terlebih dahulu untuk melakukan pemesanan.',
+      });
+    }
 
     const targetDate = date || bookingDate;
     const finalNotes = haircutNotes || notes || null;
@@ -138,7 +168,6 @@ export const createBooking = async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, message: 'Data reservasi belum lengkap' });
     }
 
-    // Validasi libur roster sebelum membuka transaksi
     const bookingDateObj = new Date(`${targetDate}T00:00:00`);
     const dayOfWeek = bookingDateObj.getDay();
 
@@ -158,68 +187,59 @@ export const createBooking = async (req: Request, res: Response) => {
 
     await client.query('BEGIN');
 
-    // 1. Ambil atau Buat Data Customer (Prioritaskan Akun Member yang Sedang Login)
-    let customerId: string = '';
-    const cleanPhone = (customerPhone || '081299887766').trim();
+    // Bersihkan lagi di dalam transaksi untuk akurasi penuh
+    await client.query(`
+      UPDATE bookings
+      SET status = 'EXPIRED'
+      WHERE status = 'PENDING_PAYMENT'
+        AND expires_at IS NOT NULL
+        AND expires_at <= NOW()
+    `);
+
+    // 1. Pastikan Data Customer Tersinkronisasi & Gabungkan Jika Ada Duplikat Nama/No HP
+    let customerId = loggedInCustomerId;
+    const cleanPhone = (customerPhone || '').trim();
     const cleanName = (customerName || 'Pelanggan Online').trim();
 
-    if (loggedInCustomerId) {
-      const checkMember = await client.query('SELECT id FROM customers WHERE id = $1', [loggedInCustomerId]);
-      if (checkMember.rowCount && checkMember.rowCount > 0) {
-        customerId = loggedInCustomerId;
+    const dupCheck = await client.query(
+      `SELECT id, phone, haircut_notes,
+              COALESCE(loyalty_points, 0) AS pts,
+              COALESCE(total_visits, 0) AS visits,
+              COALESCE(total_spend, 0) AS spend
+       FROM customers
+       WHERE id != $1
+         AND (
+           ($2 != '' AND phone = $2)
+           OR LOWER(full_name) = LOWER($3)
+         )`,
+      [customerId, cleanPhone, cleanName]
+    );
 
-        // Jika nomor WA yang diketik tadinya dipakai oleh data lama (misal 'yanto'), satukan poinnya ke akun Yosself
-        const phoneConflict = await client.query(
-          'SELECT id, COALESCE(loyalty_points, 0) AS pts, COALESCE(total_visits, 0) AS visits, COALESCE(total_spend, 0) AS spend FROM customers WHERE phone = $1 AND id != $2',
-          [cleanPhone, customerId]
-        );
-
-        if (phoneConflict.rowCount && phoneConflict.rowCount > 0) {
-          for (const oldRow of phoneConflict.rows) {
-            await client.query('UPDATE bookings SET customer_id = $1 WHERE customer_id = $2', [customerId, oldRow.id]);
-            await client.query('UPDATE transactions SET customer_id = $1 WHERE customer_id = $2', [customerId, oldRow.id]);
-            await client.query(
-              `UPDATE customers 
-               SET loyalty_points = COALESCE(loyalty_points, 0) + $1,
-                   total_visits = COALESCE(total_visits, 0) + $2,
-                   total_spend = COALESCE(total_spend, 0) + $3
-               WHERE id = $4`,
-              [oldRow.pts, oldRow.visits, oldRow.spend, customerId]
-            );
-            await client.query('DELETE FROM customers WHERE id = $1', [oldRow.id]);
-          }
-        }
-
-        // Update nama, nomor WA, dan catatan cukur pada akun member yang login
+    if (dupCheck.rowCount && dupCheck.rowCount > 0) {
+      for (const oldRow of dupCheck.rows) {
+        await client.query('UPDATE bookings SET customer_id = $1 WHERE customer_id = $2', [customerId, oldRow.id]);
+        await client.query('UPDATE transactions SET customer_id = $1 WHERE customer_id = $2', [customerId, oldRow.id]);
         await client.query(
-          `UPDATE customers 
-           SET full_name = $1, phone = $2, haircut_notes = COALESCE($3, haircut_notes)
-           WHERE id = $4`,
-          [cleanName, cleanPhone, finalNotes, customerId]
+          `UPDATE customers
+           SET loyalty_points = COALESCE(loyalty_points, 0) + $1,
+               total_visits = COALESCE(total_visits, 0) + $2,
+               total_spend = COALESCE(total_spend, 0) + $3,
+               haircut_notes = COALESCE($4, haircut_notes, $5)
+           WHERE id = $6`,
+          [oldRow.pts, oldRow.visits, oldRow.spend, finalNotes, oldRow.haircut_notes, customerId]
         );
+        await client.query('DELETE FROM customers WHERE id = $1', [oldRow.id]);
       }
     }
 
-    if (!customerId) {
-      const existingCust = await client.query('SELECT id FROM customers WHERE phone = $1 LIMIT 1', [cleanPhone]);
-      if (existingCust.rowCount && existingCust.rowCount > 0) {
-        customerId = existingCust.rows[0].id;
-        await client.query(
-          `UPDATE customers 
-           SET full_name = $1, haircut_notes = COALESCE($2, haircut_notes)
-           WHERE id = $3`,
-          [cleanName, finalNotes, customerId]
-        );
-      } else {
-        const newCust = await client.query(
-          `INSERT INTO customers (tenant_id, phone, full_name, segment, loyalty_points, haircut_notes)
-           VALUES ((SELECT tenant_id FROM outlets LIMIT 1), $1, $2, 'NEW', 0, $3)
-           RETURNING id`,
-          [cleanPhone, cleanName, finalNotes]
-        );
-        customerId = newCust.rows[0].id;
-      }
-    }
+    await client.query(
+      `UPDATE customers
+       SET full_name = $1,
+           phone = COALESCE(NULLIF($2, ''), phone),
+           haircut_notes = COALESCE(NULLIF($3, ''), haircut_notes)
+       WHERE id = $4`,
+      [cleanName, cleanPhone, finalNotes, customerId]
+    );
 
     // 2. Ambil Informasi Layanan
     const srv = await client.query(
@@ -234,71 +254,67 @@ export const createBooking = async (req: Request, res: Response) => {
     const endMinutes = h * 60 + m + Number(duration_minutes);
     const endTime = `${Math.floor(endMinutes / 60).toString().padStart(2, '0')}:${(endMinutes % 60).toString().padStart(2, '0')}:00`;
 
-    // 4. Validasi Bentrok Jadwal (Slot Conflict)
+    // 4. Validasi Bentrok Jadwal (Termasuk yang sedang PENDING_PAYMENT < 10 menit) dengan Penguncian
     const conflict = await client.query(
-      `SELECT id FROM bookings 
-       WHERE barber_id = $1 AND booking_date = $2 
-         AND status NOT IN ('CANCELLED', 'NO_SHOW')
-         AND (start_time < $4 AND end_time > $3)`,
+      `SELECT id FROM bookings
+       WHERE barber_id = $1
+         AND booking_date = $2
+         AND (
+           UPPER(status) IN ('CONFIRMED', 'PAID', 'COMPLETED')
+           OR (UPPER(status) = 'PENDING_PAYMENT' AND expires_at > NOW())
+         )
+         AND (start_time < $4 AND end_time > $3)
+       FOR UPDATE`,
       [barberId, targetDate, startTime, endTime]
     );
 
     if (conflict.rowCount && conflict.rowCount > 0) {
-      throw new Error('Slot jadwal sudah dipesan pelanggan lain. Silakan pilih jam lain.');
+      throw new Error('Slot jam ini sedang dipesan / dikunci oleh pelanggan lain. Silakan pilih jam lain.');
     }
 
     const bookingCode = `BRB-${Date.now().toString().slice(-6)}`;
 
-    // 5. Simpan Data Booking & Booking Items
+    // 5. Simpan Booking dengan status PENDING_PAYMENT dan batas waktu 10 menit
     const bookingInsert = await client.query(
       `INSERT INTO bookings (
         outlet_id, booking_code, customer_id, barber_id,
-        booking_date, start_time, end_time, status, notes
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'CONFIRMED', $8) RETURNING id`,
+        booking_date, start_time, end_time, status, payment_status, expires_at, notes
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, 'PENDING_PAYMENT', 'UNPAID', NOW() + INTERVAL '10 minutes', $8
+      ) RETURNING id, expires_at`,
       [outletId, bookingCode, customerId, barberId, targetDate, startTime, endTime, finalNotes]
     );
+
+    const bookingId = bookingInsert.rows[0].id;
+    const expiresAt = bookingInsert.rows[0].expires_at;
 
     await client.query(
       `INSERT INTO booking_items (booking_id, service_id, price, duration_minutes)
        VALUES ($1, $2, $3, $4)`,
-      [bookingInsert.rows[0].id, serviceId, base_price, duration_minutes]
+      [bookingId, serviceId, base_price, duration_minutes]
     );
 
     await client.query('COMMIT');
 
-    // Ambil Nama Kapster untuk Notifikasi
-    const barberRes = await pool.query('SELECT nickname FROM barbers WHERE id = $1', [barberId]);
-    const barberNickname = barberRes.rows[0]?.nickname || 'Kapster';
-
-    // 6. Kirim Respons Berhasil ke Frontend
-    res.status(201).json({
+    return res.status(201).json({
       success: true,
-      message: 'Booking berhasil dikonfirmasi!',
-      data: { bookingCode, date: targetDate, startTime, endTime },
-    });
-
-    // 7. Kirim Notifikasi WhatsApp Otomatis (Asinkron / Non-Blocking)
-    if (customerPhone) {
-      sendBookingConfirmationWA({
-        phone: customerPhone,
-        customerName: customerName || 'Pelanggan',
+      message: 'Slot berhasil dikunci selama 10 menit. Silakan selesaikan pembayaran!',
+      data: {
+        bookingId,
         bookingCode,
-        serviceName: serviceName || 'Treatment',
-        barberName: barberNickname,
-        bookingDate: targetDate,
-        startTime: startTime,
+        date: targetDate,
+        startTime,
+        endTime,
         price: Number(base_price),
-      }).catch((waErr) => console.error('[WA_NOTIF_ERROR]', waErr.message));
-    }
-
-    return;
+        serviceName,
+        expiresAt,
+        status: 'PENDING_PAYMENT',
+      },
+    });
   } catch (error: any) {
     try {
       await client.query('ROLLBACK');
     } catch {}
-
-    console.error('[CREATE_BOOKING_ERROR]', error);
-
     if (!res.headersSent) {
       return res.status(400).json({ success: false, message: error.message });
     }
@@ -307,13 +323,123 @@ export const createBooking = async (req: Request, res: Response) => {
   }
 };
 
+// POST /api/v1/bookings/:id/pay (Konfirmasi Pembayaran dalam 10 Menit)
+export const confirmBookingPayment = async (req: Request, res: Response) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const { paymentMethod = 'QRIS' } = req.body;
+
+    await client.query('BEGIN');
+
+    const checkRes = await client.query(
+      `SELECT b.*, c.full_name AS customer_name, c.phone AS customer_phone,
+              bar.nickname AS barber_name, s.name AS service_name, bi.price
+       FROM bookings b
+       LEFT JOIN customers c ON b.customer_id = c.id
+       LEFT JOIN barbers bar ON b.barber_id = bar.id
+       LEFT JOIN booking_items bi ON bi.booking_id = b.id
+       LEFT JOIN services s ON bi.service_id = s.id
+       WHERE b.id = $1
+       FOR UPDATE OF b`,
+      [id]
+    );
+
+    if (checkRes.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Data reservasi tidak ditemukan' });
+    }
+
+    const booking = checkRes.rows[0];
+
+    // Cek apakah sudah lewat 10 menit atau sudah EXPIRED
+    const isExpired =
+      booking.status === 'EXPIRED' ||
+      (booking.expires_at && new Date(booking.expires_at).getTime() <= Date.now());
+
+    if (isExpired) {
+      await client.query(`UPDATE bookings SET status = 'EXPIRED' WHERE id = $1`, [id]);
+      await client.query('COMMIT');
+      return res.status(400).json({
+        success: false,
+        message: 'Waktu pembayaran 10 menit telah habis! Pesanan hangus dan slot jam telah dibuka kembali untuk pelanggan lain.',
+      });
+    }
+
+    await client.query(
+      `UPDATE bookings
+       SET status = 'CONFIRMED',
+           payment_status = 'PAID',
+           payment_method = $1,
+           paid_at = NOW()
+       WHERE id = $2`,
+      [paymentMethod, id]
+    );
+
+    await client.query('COMMIT');
+
+    // Kirim konfirmasi WhatsApp setelah pembayaran berhasil
+    if (booking.customer_phone && !String(booking.customer_phone).startsWith('WA-')) {
+      sendBookingConfirmationWA({
+        phone: booking.customer_phone,
+        customerName: booking.customer_name || 'Pelanggan',
+        bookingCode: booking.booking_code,
+        serviceName: booking.service_name || 'Treatment',
+        barberName: booking.barber_name || 'Kapster',
+        bookingDate: String(booking.booking_date).slice(0, 10),
+        startTime: String(booking.start_time).slice(0, 5),
+        price: Number(booking.price || 0),
+      }).catch((waErr) => console.error('[WA_NOTIF_ERROR]', waErr.message));
+    }
+
+    return res.json({
+      success: true,
+      message: 'Pembayaran berhasil dikonfirmasi! Jadwal Anda telah dikunci.',
+      data: {
+        bookingId: booking.id,
+        bookingCode: booking.booking_code,
+        status: 'CONFIRMED',
+        paymentMethod,
+      },
+    });
+  } catch (err: any) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {}
+    return res.status(500).json({ success: false, message: err.message });
+  } finally {
+    client.release();
+  }
+};
+
+// POST /api/v1/bookings/:id/cancel (Batalkan / Hanguskan Pesanan & Buka Kembali Slot)
+export const cancelOrExpireBooking = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    await pool.query(
+      `UPDATE bookings
+       SET status = 'EXPIRED'
+       WHERE id = $1 AND UPPER(status) = 'PENDING_PAYMENT'`,
+      [id]
+    );
+    return res.json({
+      success: true,
+      message: 'Pesanan dibatalkan/hangus. Slot jam telah dibuka kembali untuk pelanggan lain.',
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
 // GET /api/v1/bookings/active?outletId=...
 export const getActiveBookings = async (req: Request, res: Response) => {
   try {
+    await cleanupExpiredBookings();
+
     const { outletId } = req.query;
 
     let query = `
-      SELECT 
+      SELECT
         b.id,
         b.booking_code,
         b.customer_id,
@@ -323,6 +449,7 @@ export const getActiveBookings = async (req: Request, res: Response) => {
         b.start_time,
         b.end_time,
         b.status,
+        b.payment_status,
         b.barber_id,
         b.notes,
         bi.service_id,
@@ -335,7 +462,7 @@ export const getActiveBookings = async (req: Request, res: Response) => {
       LEFT JOIN booking_items bi ON bi.booking_id = b.id
       LEFT JOIN services s ON bi.service_id = s.id
       LEFT JOIN barbers bar ON b.barber_id = bar.id
-      WHERE (b.status IS NULL OR UPPER(b.status) NOT IN ('COMPLETED', 'CANCELLED', 'VOID'))
+      WHERE UPPER(b.status) = 'CONFIRMED'
     `;
 
     const params: any[] = [];
