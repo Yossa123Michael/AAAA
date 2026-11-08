@@ -75,10 +75,14 @@ app.post('/api/v1/auth/login', login);
 
 // Auto-alter tabel customers untuk mendukung Akun Login & Google Auth
 pool.query(`
+  ALTER TABLE customers ALTER COLUMN tenant_id DROP NOT NULL;
   ALTER TABLE customers ADD COLUMN IF NOT EXISTS email VARCHAR(255);
   ALTER TABLE customers ADD COLUMN IF NOT EXISTS username VARCHAR(100);
+  ALTER TABLE customers ADD COLUMN IF NOT EXISTS password VARCHAR(255);
   ALTER TABLE customers ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);
   ALTER TABLE customers ADD COLUMN IF NOT EXISTS google_id VARCHAR(255);
+  ALTER TABLE customers ADD COLUMN IF NOT EXISTS provider_id VARCHAR(150);
+  ALTER TABLE customers ADD COLUMN IF NOT EXISTS auth_provider VARCHAR(50) DEFAULT 'LOCAL';
   ALTER TABLE customers ADD COLUMN IF NOT EXISTS avatar_url TEXT;
 `).catch((err) => console.error('Customer auth migration error:', err.message));
 
@@ -97,7 +101,7 @@ app.post('/api/v1/auth/customer/register', async (req: Request, res: Response) =
     const cleanPhone = phone && String(phone).trim() ? String(phone).trim() : null;
     const cleanUsername = username && String(username).trim() ? String(username).trim() : null;
 
-    // 1. Cek apakah email sudah pernah terdaftar (misal via Continue with Google atau daftar manual)
+    // 1. Cek apakah email sudah pernah terdaftar
     const existingEmail = await pool.query(
       `SELECT * FROM customers WHERE LOWER(email) = LOWER($1) LIMIT 1`,
       [cleanEmail]
@@ -107,7 +111,6 @@ app.post('/api/v1/auth/customer/register', async (req: Request, res: Response) =
     if (existingEmail.rows.length > 0) {
       const existingCust = existingEmail.rows[0];
 
-      // Jika password_hash sudah terisi, tolak dan arahkan untuk Login
       if (existingCust.password_hash) {
         return res.status(400).json({
           success: false,
@@ -115,11 +118,12 @@ app.post('/api/v1/auth/customer/register', async (req: Request, res: Response) =
         });
       }
 
-      // Jika password_hash masih NULL (karena sebelumnya daftar/masuk lewat Google), satukan akunnya
+      // Jika password_hash masih NULL (karena sebelumnya masuk lewat Google), satukan akunnya
       const updated = await pool.query(
         `UPDATE customers 
          SET full_name = $1,
              password_hash = $2,
+             password = $2,
              phone = COALESCE($3, phone),
              username = COALESCE($4, username)
          WHERE id = $5 
@@ -128,7 +132,6 @@ app.post('/api/v1/auth/customer/register', async (req: Request, res: Response) =
       );
       customer = updated.rows[0];
     } else {
-      // Cek duplikasi username jika diisi
       if (cleanUsername) {
         const checkUsername = await pool.query(
           `SELECT id FROM customers WHERE LOWER(username) = LOWER($1) LIMIT 1`,
@@ -142,7 +145,6 @@ app.post('/api/v1/auth/customer/register', async (req: Request, res: Response) =
         }
       }
 
-      // Cek apakah nomor HP sudah terdaftar sebelumnya di kasir POS (jika nomor HP diisi)
       if (cleanPhone) {
         const existingPhone = await pool.query(
           `SELECT * FROM customers WHERE phone = $1 LIMIT 1`,
@@ -154,7 +156,8 @@ app.post('/api/v1/auth/customer/register', async (req: Request, res: Response) =
              SET full_name = $1,
                  email = COALESCE($2, email),
                  username = COALESCE($3, username),
-                 password_hash = $4
+                 password_hash = $4,
+                 password = $4
              WHERE id = $5 
              RETURNING *`,
             [fullName.trim(), cleanEmail, cleanUsername, password, existingPhone.rows[0].id]
@@ -163,14 +166,16 @@ app.post('/api/v1/auth/customer/register', async (req: Request, res: Response) =
         }
       }
 
-      // Jika belum ada, buat baris customer baru
+      // Buat baris customer baru lengkap dengan tenant_id dari tabel outlets
       if (!customer) {
         const generatedOrCleanPhone =
           cleanPhone || `WA-${Math.floor(100000000 + Math.random() * 900000000)}`;
         const inserted = await pool.query(
-          `INSERT INTO customers (full_name, phone, email, username, password_hash, loyalty_points, total_visits, total_spend)
-           VALUES ($1, $2, $3, $4, $5, 0, 0, 0)
-           RETURNING *`,
+          `INSERT INTO customers (
+             tenant_id, full_name, phone, email, username, password_hash, password, loyalty_points, total_visits, total_spend
+           ) VALUES (
+             (SELECT tenant_id FROM outlets LIMIT 1), $1, $2, $3, $4, $5, $5, 0, 0, 0
+           ) RETURNING *`,
           [fullName.trim(), generatedOrCleanPhone, cleanEmail, cleanUsername, password]
         );
         customer = inserted.rows[0];
@@ -196,7 +201,7 @@ app.post('/api/v1/auth/customer/register', async (req: Request, res: Response) =
   }
 });
 
-// 3C. Login Pelanggan (Bisa pakai Email, Username, atau Nomor HP)
+// 3C. Login Pelanggan (Email, Username, atau Nomor HP)
 app.post('/api/v1/auth/customer/login', async (req: Request, res: Response) => {
   try {
     const { identifier, email, password } = req.body;
@@ -225,8 +230,7 @@ app.post('/api/v1/auth/customer/login', async (req: Request, res: Response) => {
 
     const c = result.rows[0];
 
-    // Jika akun ditemukan tetapi password_hash masih NULL (karena dibuat via Google)
-    if (!c.password_hash) {
+    if (!c.password_hash && (!c.password || c.auth_provider === 'GOOGLE')) {
       return res.status(400).json({
         success: false,
         message:
@@ -234,7 +238,11 @@ app.post('/api/v1/auth/customer/login', async (req: Request, res: Response) => {
       });
     }
 
-    if (c.password_hash !== password) {
+    const isPasswordMatch =
+      (c.password_hash && c.password_hash === password) ||
+      (!c.password_hash && c.password === password);
+
+    if (!isPasswordMatch) {
       return res.status(401).json({
         success: false,
         message: 'Email/Username/No. HP atau Password salah!',
@@ -266,12 +274,9 @@ app.post('/api/v1/auth/customer/google', async (req: Request, res: Response) => 
     const { accessToken, phone } = req.body;
     let { email, name, googleId, picture } = req.body;
 
-    // Jika accessToken dikirim dari Google OAuth2, verifikasi langsung ke Google UserInfo Endpoint
     if (accessToken) {
       const googleRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-        },
+        headers: { Authorization: `Bearer ${accessToken}` },
       });
 
       if (!googleRes.ok) {
@@ -297,7 +302,7 @@ app.post('/api/v1/auth/customer/google', async (req: Request, res: Response) => 
     const existing = await pool.query(
       `SELECT * FROM customers 
        WHERE LOWER(email) = LOWER($1) 
-          OR ($2::text IS NOT NULL AND google_id = $2) 
+          OR ($2::text IS NOT NULL AND (google_id = $2 OR provider_id = $2)) 
        LIMIT 1`,
       [cleanEmail, googleId || null]
     );
@@ -307,14 +312,17 @@ app.post('/api/v1/auth/customer/google', async (req: Request, res: Response) => 
       const updated = await pool.query(
         `UPDATE customers 
          SET google_id = COALESCE($1, google_id),
+             provider_id = COALESCE($1, provider_id),
              email = COALESCE(email, $2),
-             full_name = COALESCE(full_name, $3)
-         WHERE id = $4 
+             full_name = COALESCE(full_name, $3),
+             avatar_url = COALESCE($4, avatar_url)
+         WHERE id = $5 
          RETURNING *`,
         [
           googleId || null,
           cleanEmail,
           name || cleanEmail.split('@')[0],
+          picture || null,
           existing.rows[0].id,
         ]
       );
@@ -322,13 +330,16 @@ app.post('/api/v1/auth/customer/google', async (req: Request, res: Response) => 
     } else {
       const generatedPhone = phone || `WA-${Math.floor(100000000 + Math.random() * 900000000)}`;
       const inserted = await pool.query(
-        `INSERT INTO customers (full_name, email, google_id, phone, loyalty_points, total_visits, total_spend)
-         VALUES ($1, $2, $3, $4, 0, 0, 0)
-         RETURNING *`,
+        `INSERT INTO customers (
+           tenant_id, full_name, email, google_id, provider_id, auth_provider, avatar_url, phone, loyalty_points, total_visits, total_spend
+         ) VALUES (
+           (SELECT tenant_id FROM outlets LIMIT 1), $1, $2, $3, $3, 'GOOGLE', $4, $5, 0, 0, 0
+         ) RETURNING *`,
         [
           name || cleanEmail.split('@')[0],
           cleanEmail,
           googleId || null,
+          picture || null,
           generatedPhone,
         ]
       );
@@ -353,9 +364,6 @@ app.post('/api/v1/auth/customer/google', async (req: Request, res: Response) => 
     res.status(500).json({ success: false, message: err.message });
   }
 });
-
-app.post('/api/v1/auth/register-customer', registerCustomer);
-app.post('/api/v1/auth/social-login', socialLogin);
 
 // 4. POS Kasir & Transaksi
 app.post('/api/v1/pos/checkout', checkout);
