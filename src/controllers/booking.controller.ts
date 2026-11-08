@@ -323,24 +323,41 @@ export const createBooking = async (req: Request, res: Response) => {
   }
 };
 
-// POST /api/v1/bookings/:id/pay (Konfirmasi Pembayaran dalam 10 Menit)
+// Auto-ensure kolom tukar poin pada tabel bookings
+pool.query(`
+  ALTER TABLE bookings ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP WITH TIME ZONE;
+  ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_status VARCHAR(30) DEFAULT 'UNPAID';
+  ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_method VARCHAR(50);
+  ALTER TABLE bookings ADD COLUMN IF NOT EXISTS paid_at TIMESTAMP WITH TIME ZONE;
+  ALTER TABLE bookings ADD COLUMN IF NOT EXISTS points_redeemed INT DEFAULT 0;
+  ALTER TABLE bookings ADD COLUMN IF NOT EXISTS discount_amount NUMERIC(14,2) DEFAULT 0;
+  ALTER TABLE bookings ADD COLUMN IF NOT EXISTS final_price NUMERIC(14,2) DEFAULT 0;
+`).catch((err) => console.error('[BOOKING_SCHEMA_SYNC]', err.message));
+
+// POST /api/v1/bookings/:id/pay (Konfirmasi Pembayaran dalam 10 Menit + Tukar Poin)
 export const confirmBookingPayment = async (req: Request, res: Response) => {
   const client = await pool.connect();
   try {
     const { id } = req.params;
-    const { paymentMethod = 'QRIS' } = req.body;
+    const { paymentMethod = 'QRIS', pointsRedeemed = 0 } = req.body;
 
     await client.query('BEGIN');
 
     const checkRes = await client.query(
-      `SELECT b.*, c.full_name AS customer_name, c.phone AS customer_phone,
-              bar.nickname AS barber_name, s.name AS service_name, bi.price
+      `SELECT b.*,
+              c.id AS cust_id,
+              c.full_name AS customer_name,
+              c.phone AS customer_phone,
+              COALESCE(c.loyalty_points, 0) AS current_points,
+              bar.nickname AS barber_name,
+              s.name AS service_name,
+              COALESCE(bi.price, s.base_price, 0) AS original_price
        FROM bookings b
        LEFT JOIN customers c ON b.customer_id = c.id
        LEFT JOIN barbers bar ON b.barber_id = bar.id
        LEFT JOIN booking_items bi ON bi.booking_id = b.id
        LEFT JOIN services s ON bi.service_id = s.id
-       WHERE b.id = $1
+       WHERE b.id::text = $1 OR b.booking_code = $1
        FOR UPDATE OF b`,
       [id]
     );
@@ -358,7 +375,7 @@ export const confirmBookingPayment = async (req: Request, res: Response) => {
       (booking.expires_at && new Date(booking.expires_at).getTime() <= Date.now());
 
     if (isExpired) {
-      await client.query(`UPDATE bookings SET status = 'EXPIRED' WHERE id = $1`, [id]);
+      await client.query(`UPDATE bookings SET status = 'EXPIRED' WHERE id = $1`, [booking.id]);
       await client.query('COMMIT');
       return res.status(400).json({
         success: false,
@@ -366,30 +383,74 @@ export const confirmBookingPayment = async (req: Request, res: Response) => {
       });
     }
 
+    // Validasi & Hitung Tukar Poin (1 Poin = Rp 1.000)
+    const originalPrice = Number(booking.original_price || 0);
+    const availablePoints = Number(booking.current_points || 0);
+    const maxRedeemablePoints = Math.min(availablePoints, Math.floor(originalPrice / 1000));
+    const requestedPoints = Math.max(0, Math.floor(Number(pointsRedeemed) || 0));
+
+    if (requestedPoints > availablePoints) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        success: false,
+        message: `Poin Anda tidak mencukupi (Saldo saat ini: ${availablePoints} Pts).`,
+      });
+    }
+
+    const appliedPoints = Math.min(requestedPoints, maxRedeemablePoints);
+    const discountAmount = appliedPoints * 1000;
+    const finalPrice = Math.max(0, originalPrice - discountAmount);
+    let remainingPoints = availablePoints;
+
+    // Potong saldo poin member jika menggunakan fitur tukar poin
+    if (appliedPoints > 0 && booking.cust_id) {
+      const custUpdate = await client.query(
+        `UPDATE customers
+         SET loyalty_points = GREATEST(0, COALESCE(loyalty_points, 0) - $1)
+         WHERE id = $2
+         RETURNING loyalty_points`,
+        [appliedPoints, booking.cust_id]
+      );
+      remainingPoints = Number(custUpdate.rows[0]?.loyalty_points ?? availablePoints - appliedPoints);
+    }
+
     await client.query(
       `UPDATE bookings
        SET status = 'CONFIRMED',
            payment_status = 'PAID',
            payment_method = $1,
+           points_redeemed = $2,
+           discount_amount = $3,
+           final_price = $4,
            paid_at = NOW()
-       WHERE id = $2`,
-      [paymentMethod, id]
+       WHERE id = $5`,
+      [paymentMethod, appliedPoints, discountAmount, finalPrice, booking.id]
+    );
+
+    // Update harga di booking_items agar sinkron saat kasir Check-In
+    await client.query(
+      `UPDATE booking_items SET price = $1 WHERE booking_id = $2`,
+      [finalPrice, booking.id]
     );
 
     await client.query('COMMIT');
 
-    // Kirim konfirmasi WhatsApp setelah pembayaran berhasil
+    // Kirim konfirmasi WhatsApp secara sinkron (await) agar tidak diputus Vercel Serverless
     if (booking.customer_phone && !String(booking.customer_phone).startsWith('WA-')) {
-      sendBookingConfirmationWA({
-        phone: booking.customer_phone,
-        customerName: booking.customer_name || 'Pelanggan',
-        bookingCode: booking.booking_code,
-        serviceName: booking.service_name || 'Treatment',
-        barberName: booking.barber_name || 'Kapster',
-        bookingDate: String(booking.booking_date).slice(0, 10),
-        startTime: String(booking.start_time).slice(0, 5),
-        price: Number(booking.price || 0),
-      }).catch((waErr) => console.error('[WA_NOTIF_ERROR]', waErr.message));
+      try {
+        await sendBookingConfirmationWA({
+          phone: booking.customer_phone,
+          customerName: booking.customer_name || 'Pelanggan',
+          bookingCode: booking.booking_code,
+          serviceName: booking.service_name || 'Treatment',
+          barberName: booking.barber_name || 'Kapster',
+          bookingDate: String(booking.booking_date).slice(0, 10),
+          startTime: String(booking.start_time).slice(0, 5),
+          price: finalPrice,
+        });
+      } catch (waErr: any) {
+        console.error('[WA_NOTIF_ERROR]', waErr.message);
+      }
     }
 
     return res.json({
@@ -400,6 +461,11 @@ export const confirmBookingPayment = async (req: Request, res: Response) => {
         bookingCode: booking.booking_code,
         status: 'CONFIRMED',
         paymentMethod,
+        originalPrice,
+        pointsRedeemed: appliedPoints,
+        discountAmount,
+        finalPrice,
+        remainingPoints,
       },
     });
   } catch (err: any) {
