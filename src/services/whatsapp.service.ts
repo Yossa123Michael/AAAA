@@ -15,8 +15,11 @@ export const sendWhatsAppMessage = async (targetPhone: string, message: string) 
   const url = process.env.WA_GATEWAY_URL || 'https://api.fonnte.com/send';
 
   if (!token) {
-    console.warn('[WA Gateway] WA_GATEWAY_TOKEN belum diatur di .env');
-    return { success: false, message: 'Token tidak ditemukan' };
+    console.warn('[WA Gateway] WA_GATEWAY_TOKEN belum diatur di Environment Variables');
+    return {
+      success: false,
+      message: 'WA_GATEWAY_TOKEN belum diatur di Environment Variables server backend (Vercel).',
+    };
   }
 
   const destination = formatPhoneNumber(targetPhone);
@@ -25,7 +28,7 @@ export const sendWhatsAppMessage = async (targetPhone: string, message: string) 
     const response = await fetch(url, {
       method: 'POST',
       headers: {
-        'Authorization': token,
+        Authorization: token,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -35,12 +38,21 @@ export const sendWhatsAppMessage = async (targetPhone: string, message: string) 
       }),
     });
 
-    const result = await response.json();
-    console.log(`[WA Gateway] Pesan terkirim ke ${destination}:`, result);
+    const result: any = await response.json();
+    console.log(`[WA Gateway] Respons Fonnte ke ${destination}:`, result);
+
+    if (result && result.status === false) {
+      return {
+        success: false,
+        message: `Fonnte menolak pengiriman: ${result.reason || 'Perangkat WA belum terhubung / token tidak valid'}`,
+        result,
+      };
+    }
+
     return { success: true, result };
   } catch (error: any) {
     console.error(`[WA Gateway] Gagal mengirim pesan ke ${destination}:`, error.message);
-    return { success: false, error: error.message };
+    return { success: false, message: error.message, error: error.message };
   }
 };
 
@@ -55,7 +67,7 @@ export const sendBookingConfirmationWA = async (params: {
   startTime: string;
   price: number;
 }) => {
-  const message = 
+  const message =
 `💈 *KONFIRMASI RESERVASI - BARBERSHOP OS* 💈
 
 Halo Kak *${params.customerName}*, terima kasih telah melakukan reservasi online!
@@ -66,7 +78,7 @@ Berikut rincian jadwal kunjungan Anda:
 💈 *Kapster*      : ${params.barberName}
 📅 *Tanggal*      : ${params.bookingDate}
 ⏰ *Jam*          : ${params.startTime} WITA
-💰 *Estimasi Biaya*: Rp ${Number(params.price).toLocaleString('id-ID')}
+💰 *Total Biaya*  : Rp ${Number(params.price).toLocaleString('id-ID')} (LUNAS)
 
 📍 *Lokasi*: Cabang Makassar
 Mohon hadir 5-10 menit sebelum jadwal dimulai. Tunjukkan kode booking ini saat tiba di kasir. Sampai jumpa! ✨`;
