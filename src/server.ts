@@ -168,8 +168,8 @@ app.post('/api/v1/auth/customer/register', async (req: Request, res: Response) =
         const generatedOrCleanPhone =
           cleanPhone || `WA-${Math.floor(100000000 + Math.random() * 900000000)}`;
         const inserted = await pool.query(
-          `INSERT INTO customers (outlet_id, full_name, phone, email, username, password_hash, loyalty_points, total_visits, total_spend)
-           VALUES ('22222222-2222-2222-2222-222222222222', $1, $2, $3, $4, $5, 0, 0, 0)
+          `INSERT INTO customers (full_name, phone, email, username, password_hash, loyalty_points, total_visits, total_spend)
+           VALUES ($1, $2, $3, $4, $5, 0, 0, 0)
            RETURNING *`,
           [fullName.trim(), generatedOrCleanPhone, cleanEmail, cleanUsername, password]
         );
@@ -308,15 +308,13 @@ app.post('/api/v1/auth/customer/google', async (req: Request, res: Response) => 
         `UPDATE customers 
          SET google_id = COALESCE($1, google_id),
              email = COALESCE(email, $2),
-             full_name = COALESCE(full_name, $3),
-             avatar_url = COALESCE($4, avatar_url)
-         WHERE id = $5 
+             full_name = COALESCE(full_name, $3)
+         WHERE id = $4 
          RETURNING *`,
         [
           googleId || null,
           cleanEmail,
           name || cleanEmail.split('@')[0],
-          picture || null,
           existing.rows[0].id,
         ]
       );
@@ -324,15 +322,14 @@ app.post('/api/v1/auth/customer/google', async (req: Request, res: Response) => 
     } else {
       const generatedPhone = phone || `WA-${Math.floor(100000000 + Math.random() * 900000000)}`;
       const inserted = await pool.query(
-        `INSERT INTO customers (outlet_id, full_name, email, google_id, phone, avatar_url, loyalty_points, total_visits, total_spend)
-         VALUES ('22222222-2222-2222-2222-222222222222', $1, $2, $3, $4, $5, 0, 0, 0)
+        `INSERT INTO customers (full_name, email, google_id, phone, loyalty_points, total_visits, total_spend)
+         VALUES ($1, $2, $3, $4, 0, 0, 0)
          RETURNING *`,
         [
           name || cleanEmail.split('@')[0],
           cleanEmail,
           googleId || null,
           generatedPhone,
-          picture || null,
         ]
       );
       c = inserted.rows[0];
