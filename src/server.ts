@@ -7,7 +7,7 @@ import './index';
 
 // Controllers
 import { checkout, getRecentTransactions, voidTransaction, validateVoucher, sendReceiptWhatsApp } from './controllers/pos.controller';
-import { getBarberAvailability, createBooking, getActiveBookings, confirmBookingPayment, cancelOrExpireBooking } from './controllers/booking.controller';
+import { getBarberAvailability, createBooking, getActiveBookings, confirmBookingPayment, cancelOrExpireBooking, getCustomerBookingHistory } from './controllers/booking.controller';
 import { closeShift, reopenShift } from './controllers/shift.controller';
 import { getDashboardSummary } from './controllers/dashboard.controller';
 import { getInventoryStocks, restockInventory } from './controllers/inventory.controller';
@@ -403,6 +403,7 @@ app.post('/api/v1/pos/vouchers/validate', validateVoucher);
 app.post('/api/v1/pos/send-receipt-wa', sendReceiptWhatsApp);
 
 // 5. Booking & Antrean
+app.get('/api/v1/bookings/customer-history', getCustomerBookingHistory);
 app.get('/api/v1/bookings/availability', getBarberAvailability);
 app.post('/api/v1/bookings', createBooking);
 app.get('/api/v1/bookings/active', getActiveBookings);
