@@ -53,7 +53,7 @@ app.get('/', (_req: Request, res: Response) => {
 // 2. Rute Test Katalog
 app.get('/api/v1/test-catalog', async (_req: Request, res: Response) => {
   try {
-    const services = await pool.query('SELECT id, code, name, base_price, default_commission_percent FROM services WHERE COALESCE(is_active, true) = true');
+    const services = await pool.query('SELECT id, code, name, base_price, COALESCE(duration_minutes, 45) AS duration_minutes, default_commission_percent FROM services WHERE COALESCE(is_active, true) = true');
     const products = await pool.query('SELECT id, sku, name, selling_price, default_commission_percent FROM products WHERE COALESCE(is_active, true) = true');
     const barbers = await pool.query('SELECT id, nickname, level FROM barbers WHERE COALESCE(is_active, true) = true');
 
